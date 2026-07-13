@@ -1,5 +1,6 @@
 //! OpenAI Chat Completions SSE → OpenAI Responses SSE conversion.
 
+use super::codex_responses_sse as sse;
 use super::{
     codex_chat_common::{
         extract_reasoning_field_text, split_leading_think_block, strip_leading_think_open_tag,
@@ -270,20 +271,8 @@ impl ChatToResponsesState {
         let response = self.base_response("in_progress", Vec::new());
 
         vec![
-            sse_event(
-                "response.created",
-                json!({
-                    "type": "response.created",
-                    "response": response
-                }),
-            ),
-            sse_event(
-                "response.in_progress",
-                json!({
-                    "type": "response.in_progress",
-                    "response": self.base_response("in_progress", Vec::new())
-                }),
-            ),
+            sse::response_created(&response),
+            sse::response_in_progress(&response),
         ]
     }
 
@@ -297,45 +286,16 @@ impl ChatToResponsesState {
             self.reasoning.item_id = item_id.clone();
             self.reasoning.added = true;
 
-            events.push(sse_event(
-                "response.output_item.added",
-                json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "id": item_id,
-                        "type": "reasoning",
-                        "status": "in_progress",
-                        "summary": []
-                    }
-                }),
-            ));
-            events.push(sse_event(
-                "response.reasoning_summary_part.added",
-                json!({
-                    "type": "response.reasoning_summary_part.added",
-                    "item_id": self.reasoning.item_id,
-                    "output_index": output_index,
-                    "summary_index": 0,
-                    "part": {
-                        "type": "summary_text",
-                        "text": ""
-                    }
-                }),
-            ));
+            events.push(sse::reasoning_item_added(output_index, &item_id));
+            events.push(sse::reasoning_summary_part_added(output_index, &item_id));
         }
 
         self.reasoning.text.push_str(delta);
         let output_index = self.reasoning.output_index.unwrap_or(0);
-        events.push(sse_event(
-            "response.reasoning_summary_text.delta",
-            json!({
-                "type": "response.reasoning_summary_text.delta",
-                "item_id": self.reasoning.item_id,
-                "output_index": output_index,
-                "summary_index": 0,
-                "delta": delta
-            }),
+        events.push(sse::reasoning_summary_text_delta(
+            output_index,
+            &self.reasoning.item_id,
+            delta,
         ));
 
         events
@@ -351,47 +311,16 @@ impl ChatToResponsesState {
             self.text.item_id = item_id.clone();
             self.text.added = true;
 
-            events.push(sse_event(
-                "response.output_item.added",
-                json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "id": item_id,
-                        "type": "message",
-                        "status": "in_progress",
-                        "role": "assistant",
-                        "content": []
-                    }
-                }),
-            ));
-            events.push(sse_event(
-                "response.content_part.added",
-                json!({
-                    "type": "response.content_part.added",
-                    "item_id": self.text.item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {
-                        "type": "output_text",
-                        "text": "",
-                        "annotations": []
-                    }
-                }),
-            ));
+            events.push(sse::message_item_added(output_index, &item_id));
+            events.push(sse::message_content_part_added(output_index, &item_id));
         }
 
         self.text.text.push_str(delta);
         let output_index = self.text.output_index.unwrap_or(0);
-        events.push(sse_event(
-            "response.output_text.delta",
-            json!({
-                "type": "response.output_text.delta",
-                "item_id": self.text.item_id,
-                "output_index": output_index,
-                "content_index": 0,
-                "delta": delta
-            }),
+        events.push(sse::output_text_delta(
+            output_index,
+            &self.text.item_id,
+            delta,
         ));
 
         events
@@ -429,8 +358,10 @@ impl ChatToResponsesState {
             if let Some(id) = id_delta {
                 state.call_id = id;
             }
-            if let Some(name) = name_delta {
-                state.name = name;
+            if let Some(ref name) = name_delta {
+                if !name.is_empty() {
+                    state.name.clone_from(name);
+                }
             }
             if !args_delta.is_empty() {
                 state.arguments.push_str(&args_delta);
@@ -442,7 +373,7 @@ impl ChatToResponsesState {
                 }
             }
 
-            if !state.added && (!state.call_id.is_empty() || !state.name.is_empty()) {
+            if !state.added && !state.call_id.is_empty() && !state.name.is_empty() {
                 should_add = true;
                 pending_arguments = state.arguments.clone();
             } else if state.added {
@@ -464,9 +395,6 @@ impl ChatToResponsesState {
             if state.call_id.is_empty() {
                 state.call_id = format!("call_{chat_index}");
             }
-            if state.name.is_empty() {
-                state.name = "unknown_tool".to_string();
-            }
             state.output_index = Some(assigned);
             let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&state.name);
             state.item_id = response_tool_call_item_id_from_chat_name(
@@ -486,36 +414,21 @@ impl ChatToResponsesState {
                 &self.tool_context,
             );
 
-            events.push(sse_event(
-                "response.output_item.added",
-                json!({
-                    "type": "response.output_item.added",
-                    "output_index": assigned,
-                    "item": item
-                }),
-            ));
+            events.push(sse::output_item_added(assigned, &item));
 
             if !pending_arguments.is_empty() && !is_custom_tool {
-                events.push(sse_event(
-                    "response.function_call_arguments.delta",
-                    json!({
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": state.item_id,
-                        "output_index": assigned,
-                        "delta": pending_arguments
-                    }),
+                events.push(sse::function_call_arguments_delta(
+                    assigned,
+                    &state.item_id,
+                    &pending_arguments,
                 ));
             }
         } else if !args_delta.is_empty() && !is_custom_tool {
             if let Some(output_index) = output_index {
-                events.push(sse_event(
-                    "response.function_call_arguments.delta",
-                    json!({
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "delta": args_delta
-                    }),
+                events.push(sse::function_call_arguments_delta(
+                    output_index,
+                    &item_id,
+                    &args_delta,
                 ));
             }
         }
@@ -568,13 +481,7 @@ impl ChatToResponsesState {
             response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
 
-        events.push(sse_event(
-            "response.completed",
-            json!({
-                "type": "response.completed",
-                "response": response
-            }),
-        ));
+        events.push(sse::response_completed(&response));
         self.completed = true;
         events
     }
@@ -587,50 +494,10 @@ impl ChatToResponsesState {
         let output_index = self.reasoning.output_index.unwrap_or(0);
         let item_id = self.reasoning.item_id.clone();
         let text = self.reasoning.text.clone();
-        let item = json!({
-            "id": item_id,
-            "type": "reasoning",
-            "summary": [{
-                "type": "summary_text",
-                "text": text
-            }]
-        });
-        self.output_items.push((output_index, item.clone()));
+        let (events, item) = sse::reasoning_close(output_index, &item_id, &text);
+        self.output_items.push((output_index, item));
         self.reasoning.done = true;
-
-        vec![
-            sse_event(
-                "response.reasoning_summary_text.done",
-                json!({
-                    "type": "response.reasoning_summary_text.done",
-                    "item_id": self.reasoning.item_id,
-                    "output_index": output_index,
-                    "summary_index": 0,
-                    "text": self.reasoning.text
-                }),
-            ),
-            sse_event(
-                "response.reasoning_summary_part.done",
-                json!({
-                    "type": "response.reasoning_summary_part.done",
-                    "item_id": self.reasoning.item_id,
-                    "output_index": output_index,
-                    "summary_index": 0,
-                    "part": {
-                        "type": "summary_text",
-                        "text": self.reasoning.text
-                    }
-                }),
-            ),
-            sse_event(
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": item
-                }),
-            ),
-        ]
+        events
     }
 
     fn finalize_text(&mut self) -> Vec<Bytes> {
@@ -639,54 +506,12 @@ impl ChatToResponsesState {
         }
 
         let output_index = self.text.output_index.unwrap_or(0);
-        let item = json!({
-            "id": self.text.item_id,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": self.text.text,
-                "annotations": []
-            }]
-        });
-        self.output_items.push((output_index, item.clone()));
+        let item_id = self.text.item_id.clone();
+        let text = self.text.text.clone();
+        let (events, item) = sse::message_close(output_index, &item_id, &text);
+        self.output_items.push((output_index, item));
         self.text.done = true;
-
-        vec![
-            sse_event(
-                "response.output_text.done",
-                json!({
-                    "type": "response.output_text.done",
-                    "item_id": self.text.item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "text": self.text.text
-                }),
-            ),
-            sse_event(
-                "response.content_part.done",
-                json!({
-                    "type": "response.content_part.done",
-                    "item_id": self.text.item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {
-                        "type": "output_text",
-                        "text": self.text.text,
-                        "annotations": []
-                    }
-                }),
-            ),
-            sse_event(
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": item
-                }),
-            ),
-        ]
+        events
     }
 
     fn finalize_tools(&mut self) -> Vec<Bytes> {
@@ -696,6 +521,21 @@ impl ChatToResponsesState {
         for key in keys {
             let mut add_event: Option<Bytes> = None;
             if self.tools.get(&key).map(|state| state.done).unwrap_or(true) {
+                continue;
+            }
+
+            // Skip tool calls with missing names (defensive: some models generate
+            // tool call deltas without providing a valid function name)
+            let has_bad_name = self
+                .tools
+                .get(&key)
+                .map(|state| state.name.is_empty())
+                .unwrap_or(true);
+            if has_bad_name {
+                if let Some(state) = self.tools.get_mut(&key) {
+                    state.done = true;
+                }
+                log::warn!("[Codex] Skipping streaming tool call with missing name");
                 continue;
             }
 
@@ -713,9 +553,6 @@ impl ChatToResponsesState {
                 if state.call_id.is_empty() {
                     state.call_id = format!("call_{key}");
                 }
-                if state.name.is_empty() {
-                    state.name = "unknown_tool".to_string();
-                }
                 state.output_index = Some(assigned);
                 state.item_id = response_tool_call_item_id_from_chat_name(
                     &state.call_id,
@@ -731,14 +568,7 @@ impl ChatToResponsesState {
                     Some(&state.reasoning_content),
                     &self.tool_context,
                 );
-                add_event = Some(sse_event(
-                    "response.output_item.added",
-                    json!({
-                        "type": "response.output_item.added",
-                        "output_index": assigned,
-                        "item": item
-                    }),
-                ));
+                add_event = Some(sse::output_item_added(assigned, &item));
             }
 
             if let Some(event) = add_event {
@@ -766,44 +596,25 @@ impl ChatToResponsesState {
             if is_custom_tool {
                 let input = custom_tool_input_from_chat_arguments(&arguments);
                 if !input.is_empty() {
-                    events.push(sse_event(
-                        "response.custom_tool_call_input.delta",
-                        json!({
-                            "type": "response.custom_tool_call_input.delta",
-                            "item_id": state.item_id,
-                            "output_index": output_index,
-                            "delta": input.clone()
-                        }),
+                    events.push(sse::custom_tool_call_input_delta(
+                        output_index,
+                        &state.item_id,
+                        &input,
                     ));
                 }
-                events.push(sse_event(
-                    "response.custom_tool_call_input.done",
-                    json!({
-                        "type": "response.custom_tool_call_input.done",
-                        "item_id": state.item_id,
-                        "output_index": output_index,
-                        "input": input
-                    }),
+                events.push(sse::custom_tool_call_input_done(
+                    output_index,
+                    &state.item_id,
+                    &input,
                 ));
             } else {
-                events.push(sse_event(
-                    "response.function_call_arguments.done",
-                    json!({
-                        "type": "response.function_call_arguments.done",
-                        "item_id": state.item_id,
-                        "output_index": output_index,
-                        "arguments": arguments
-                    }),
+                events.push(sse::function_call_arguments_done(
+                    output_index,
+                    &state.item_id,
+                    &arguments,
                 ));
             }
-            events.push(sse_event(
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": item
-                }),
-            ));
+            events.push(sse::output_item_done(output_index, &item));
         }
 
         events
@@ -853,13 +664,7 @@ impl ChatToResponsesState {
         let mut response = self.base_response("failed", self.completed_output_items());
         response["error"] = error;
 
-        sse_event(
-            "response.failed",
-            json!({
-                "type": "response.failed",
-                "response": response
-            }),
-        )
+        sse::response_failed(&response)
     }
 }
 
@@ -1017,13 +822,6 @@ fn extract_chat_sse_error(value: &Value) -> (String, Option<String>) {
         .map(ToString::to_string);
 
     (message, error_type)
-}
-
-fn sse_event(event: &str, data: Value) -> Bytes {
-    Bytes::from(format!(
-        "event: {event}\ndata: {}\n\n",
-        serde_json::to_string(&data).unwrap_or_default()
-    ))
 }
 
 #[cfg(test)]
