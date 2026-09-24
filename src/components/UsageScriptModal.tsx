@@ -8,12 +8,14 @@ import { usageApi, settingsApi, type AppId } from "@/lib/api";
 import { copilotGetUsage, copilotGetUsageForAccount } from "@/lib/api/copilot";
 import { useSettingsQuery } from "@/lib/query";
 import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveCodexOfficialIdentity } from "@/utils/providerCapabilities";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import {
   extractCodexBaseUrl,
   extractCodexExperimentalBearerToken,
 } from "@/utils/providerConfigUtils";
+import { parseGrokBuildConfig } from "@/utils/grokBuildConfig";
 import JsonEditor from "./JsonEditor";
 import * as prettier from "prettier/standalone";
 import * as parserBabel from "prettier/parser-babel";
@@ -159,7 +161,7 @@ function detectBalanceProvider(baseUrl: string | undefined): boolean {
 }
 
 function isOfficialSubscriptionProvider(provider: Provider, appId: AppId) {
-  if (!["claude", "codex", "gemini"].includes(appId)) return false;
+  if (!["claude", "codex", "gemini", "grokbuild"].includes(appId)) return false;
   if (provider.category === "official") return true;
 
   const config = provider.settingsConfig as Record<string, any>;
@@ -187,6 +189,12 @@ function isOfficialSubscriptionProvider(provider: Provider, appId: AppId) {
       (!baseUrl || (typeof baseUrl === "string" && baseUrl.trim() === ""))
     );
   }
+  // grokbuild 不做配置启发式，只认上方的 category === "official"：官方态判定
+  // 在后端是 TOML 解析（grok_config::is_official_live_config），正则无法忠实
+  // 镜像（引号键/inline table/非法 TOML 均会误判为官方），误判会让本组件的
+  // state 初始化丢弃已保存的非官方脚本。claude/codex/gemini 的启发式建立在
+  // 已解析的 JSON 字段上是精确的，不受此限。官方判定以 category 为 SSOT 的
+  // 理由见 ProviderCard 中的注释。
   return false;
 }
 
@@ -262,11 +270,30 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
             apiKey: env.GEMINI_API_KEY || env.GOOGLE_API_KEY,
             baseUrl: env.GOOGLE_GEMINI_BASE_URL,
           };
+        } else if (appId === "grokbuild") {
+          const grokConfig = parseGrokBuildConfig(
+            (config as any).config,
+            provider.name,
+          );
+          return {
+            apiKey: grokConfig.apiKey,
+            baseUrl: grokConfig.baseUrl,
+          };
         } else if (appId === "hermes") {
           // Hermes: settingsConfig 顶层扁平（snake_case，对应 config.yaml）
           return {
             apiKey: (config as any).api_key,
             baseUrl: (config as any).base_url,
+          };
+        } else if (appId === "pi") {
+          // Pi: provider values are camelCase; a model may override baseUrl.
+          const root = config as any;
+          const firstModel = Array.isArray(root.models)
+            ? root.models[0]
+            : undefined;
+          return {
+            apiKey: root.apiKey,
+            baseUrl: firstModel?.baseUrl || root.baseUrl,
           };
         } else if (appId === "openclaw") {
           // OpenClaw: settingsConfig 顶层扁平（camelCase，对应 openclaw.json）
@@ -295,6 +322,8 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
   };
 
   const providerCredentials = getProviderCredentials();
+  const isBoundCodexOfficial =
+    resolveCodexOfficialIdentity(appId, provider) === "managed_account";
   const isOfficialSubscription = isOfficialSubscriptionProvider(
     provider,
     appId,
@@ -308,7 +337,9 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
         isOfficialSubscription &&
         normalizedScript.templateType !== TEMPLATE_TYPES.OFFICIAL_SUBSCRIPTION
       ) {
-        return createUsageScript();
+        return createUsageScript({
+          enabled: isBoundCodexOfficial ? normalizedScript.enabled : false,
+        });
       }
       // 已有配置：如果是 coding_plan 但没有 codingPlanProvider，自动检测填充
       if (
@@ -334,7 +365,7 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
     }
 
     if (isOfficialSubscription) {
-      return createUsageScript();
+      return createUsageScript({ enabled: isBoundCodexOfficial });
     }
 
     return createUsageScript({
@@ -500,7 +531,15 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
       // 官方订阅额度模板使用 CLI/OAuth 凭据和官方 API
       if (selectedTemplate === TEMPLATE_TYPES.OFFICIAL_SUBSCRIPTION) {
         const { subscriptionApi } = await import("@/lib/api/subscription");
-        const quota = await subscriptionApi.getQuota(appId);
+        const accountId = isBoundCodexOfficial
+          ? (resolveManagedAccountId(
+              provider.meta,
+              PROVIDER_TYPES.CODEX_OAUTH,
+            ) ?? null)
+          : null;
+        const quota = isBoundCodexOfficial
+          ? await subscriptionApi.getCodexOauthQuota(accountId)
+          : await subscriptionApi.getQuota(appId);
         if (quota.success && quota.tiers.length > 0) {
           const summary = quota.tiers
             .map((tier) => `${tier.name}: ${Math.round(tier.utilization)}%`)
@@ -509,7 +548,12 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
             duration: 3000,
             closeButton: true,
           });
-          queryClient.setQueryData(["subscription", "quota", appId], quota);
+          queryClient.setQueryData(
+            isBoundCodexOfficial
+              ? ["codex_oauth", "quota", accountId ?? "default"]
+              : ["subscription", "quota", appId],
+            quota,
+          );
         } else {
           toast.error(
             `${t("usageScript.testFailed")}: ${quota.error || t("endpointTest.noResult")}`,

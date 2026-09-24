@@ -9,6 +9,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::app_config::AppType;
 use crate::error::AppError;
+use crate::services::usage_cache::UsageCache;
 use crate::store::AppState;
 
 const TEMPLATE_TYPE_OFFICIAL_SUBSCRIPTION: &str = "official_subscription";
@@ -19,6 +20,8 @@ const W_TIER_NAMES: &[&str] = &[
     crate::services::subscription::TIER_SEVEN_DAY_OPUS,
     crate::services::subscription::TIER_SEVEN_DAY_SONNET,
 ];
+// Fable 单列显示，不能被周分组的最大值合并掉。
+const FABLE_TIER_NAMES: &[&str] = &[crate::services::subscription::TIER_SEVEN_DAY_FABLE];
 // 月窗口分组：火山方舟 Agent/Coding Plan 的月窗口（5h/周/月 三档），
 // 以及 Codex 免费方案的 30 天窗口（#3651）——两者都归入 "m" 档，避免免费
 // Codex 账号在托盘里空白（前端 footer 能看到、托盘却不显示的不对称）。
@@ -26,6 +29,8 @@ const M_TIER_NAMES: &[&str] = &[
     crate::services::subscription::TIER_MONTHLY,
     crate::services::subscription::TIER_THIRTY_DAY,
 ];
+// Grok credit 额度的兜底窗口（重置距离能识别为周/月时归入 w/m 组）
+const CREDITS_TIER_NAMES: &[&str] = &[crate::services::subscription::TIER_CREDITS];
 const GEMINI_PRO_TIER_NAMES: &[&str] = &[crate::services::subscription::TIER_GEMINI_PRO];
 const GEMINI_FLASH_TIER_NAMES: &[&str] = &[crate::services::subscription::TIER_GEMINI_FLASH];
 const GEMINI_FLASH_LITE_TIER_NAMES: &[&str] =
@@ -33,7 +38,9 @@ const GEMINI_FLASH_LITE_TIER_NAMES: &[&str] =
 const TIER_LABEL_GROUPS: &[(&str, &[&str])] = &[
     ("h", H_TIER_NAMES),
     ("w", W_TIER_NAMES),
+    ("Fable", FABLE_TIER_NAMES),
     ("m", M_TIER_NAMES),
+    ("c", CREDITS_TIER_NAMES),
     ("p", GEMINI_PRO_TIER_NAMES),
     ("f", GEMINI_FLASH_TIER_NAMES),
     ("l", GEMINI_FLASH_LITE_TIER_NAMES),
@@ -56,6 +63,41 @@ pub struct TrayTexts {
     pub _auto_label: &'static str,
     pub projects_label: &'static str,
     pub no_project_label: &'static str,
+}
+
+/// 将系统区域标识映射为托盘支持的语言码。
+///
+/// 镜像前端 `i18n/getInitialLanguage` 的判定顺序，确保首次安装
+/// （`settings.language` 尚未写入）时托盘语言与界面语言一致：
+/// 繁中系统（zh-TW/HK/MO/Hant）→ `zh-TW`，其余 zh → `zh`，
+/// 日文 → `ja`，英文 → `en`，未知区域回退到 `zh`（与前端默认一致）。
+fn map_locale_to_tray_language(locale: &str) -> &'static str {
+    let locale = locale.to_lowercase();
+    if locale == "zh" {
+        "zh"
+    } else if locale.starts_with("zh-tw")
+        || locale.starts_with("zh-hk")
+        || locale.starts_with("zh-mo")
+        || locale.starts_with("zh-hant")
+    {
+        "zh-TW"
+    } else if locale.starts_with("zh") {
+        "zh"
+    } else if locale.starts_with("ja") {
+        "ja"
+    } else if locale.starts_with("en") {
+        "en"
+    } else {
+        "zh"
+    }
+}
+
+/// 读取系统区域并映射为托盘语言码；取不到区域时回退到 `zh`。
+fn detect_system_tray_language() -> &'static str {
+    sys_locale::get_locale()
+        .as_deref()
+        .map(map_locale_to_tray_language)
+        .unwrap_or("zh")
 }
 
 impl TrayTexts {
@@ -118,7 +160,7 @@ pub struct TrayAppSection {
 pub const AUTO_SUFFIX: &str = "auto";
 pub const TRAY_ID: &str = "cc-switch";
 
-pub const TRAY_SECTIONS: [TrayAppSection; 3] = [
+pub const TRAY_SECTIONS: [TrayAppSection; 4] = [
     TrayAppSection {
         app_type: AppType::Claude,
         prefix: "claude_",
@@ -139,6 +181,13 @@ pub const TRAY_SECTIONS: [TrayAppSection; 3] = [
         empty_id: "gemini_empty",
         header_label: "Gemini",
         log_name: "Gemini",
+    },
+    TrayAppSection {
+        app_type: AppType::GrokBuild,
+        prefix: "grokbuild_",
+        empty_id: "grokbuild_empty",
+        header_label: "Grok Build",
+        log_name: "Grok Build",
     },
 ];
 
@@ -259,7 +308,25 @@ fn format_script_summary(result: &crate::provider::UsageResult) -> Option<String
     }
 }
 
+fn managed_codex_account_id(provider: &crate::provider::Provider) -> Option<String> {
+    if crate::proxy::providers::is_codex_official_provider(provider) {
+        return provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+    }
+    None
+}
+
 fn provider_uses_official_subscription(provider: &crate::provider::Provider) -> bool {
+    // Managed Codex uses the account-scoped path in tray_usage_source instead
+    // of the CLI's app-wide subscription cache.
+    if managed_codex_account_id(provider).is_some() {
+        return false;
+    }
+
     provider
         .meta
         .as_ref()
@@ -271,42 +338,72 @@ fn provider_uses_official_subscription(provider: &crate::provider::Provider) -> 
         .unwrap_or(false)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TrayUsageSource {
+    ManagedCodex(String),
+    Script,
+}
+
+/// Keep the tray's refresh and display paths on the same credentials and toggle.
+fn tray_usage_source(
+    app_type: &AppType,
+    provider: &crate::provider::Provider,
+) -> Option<TrayUsageSource> {
+    if *app_type == AppType::Codex {
+        if let Some(account_id) = managed_codex_account_id(provider) {
+            // Match ProviderCard: managed accounts query by default until the
+            // user explicitly disables usage, including older saved providers.
+            let enabled = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .map(|script| script.enabled)
+                .unwrap_or(true);
+            return enabled.then_some(TrayUsageSource::ManagedCodex(account_id));
+        }
+    }
+    (provider.has_usage_script_enabled()
+        && (provider.category.as_deref() != Some("official")
+            || provider_uses_official_subscription(provider)))
+    .then_some(TrayUsageSource::Script)
+}
+
 fn format_usage_suffix(
-    app_state: &AppState,
+    usage_cache: &UsageCache,
     app_type: &AppType,
     provider: &crate::provider::Provider,
     provider_id: &str,
 ) -> Option<String> {
     // 当前脚本是否启用：禁用/删除时不再沿用旧 UsageCache 结果，
     // 并顺手 invalidate，防止后续重建继续命中过期数据。
-    let is_official_provider = provider.category.as_deref() == Some("official");
-    let can_use_script = provider.has_usage_script_enabled()
-        && (!is_official_provider || provider_uses_official_subscription(provider));
-    if can_use_script {
+    let source = tray_usage_source(app_type, provider);
+    if let Some(TrayUsageSource::ManagedCodex(account_id)) = &source {
+        // No fallback: a missing account snapshot must not display another
+        // account's quota from a provider cache or the CLI subscription cache.
+        return usage_cache
+            .with_codex_oauth(account_id, format_subscription_summary)
+            .flatten()
+            .map(|s| format!(" · {s}"));
+    }
+    if source.is_some() {
         // 脚本缓存优先（覆盖 Copilot/coding_plan/balance/自定义脚本），借用访问避免克隆整条 UsageResult。
-        if let Some(Some(s)) =
-            app_state
-                .usage_cache
-                .with_script(app_type, provider_id, format_script_summary)
+        if let Some(Some(s)) = usage_cache.with_script(app_type, provider_id, format_script_summary)
         {
             return Some(format!(" · {s}"));
         }
         if provider_uses_official_subscription(provider) {
-            if let Some(Some(s)) = app_state
-                .usage_cache
-                .with_subscription(app_type, format_subscription_summary)
+            if let Some(Some(s)) =
+                usage_cache.with_subscription(app_type, format_subscription_summary)
             {
                 return Some(format!(" · {s}"));
             }
         }
     } else {
-        app_state
-            .usage_cache
-            .invalidate_script(app_type, provider_id);
+        usage_cache.invalidate_script(app_type, provider_id);
     }
 
     if !provider_uses_official_subscription(provider) {
-        app_state.usage_cache.invalidate_subscription(app_type);
+        usage_cache.invalidate_subscription(app_type);
     }
     None
 }
@@ -465,7 +562,22 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
 
         // 强一致语义：Auto 模式开启后立即切到队列 P1（P1→P2→...）
         // 若队列为空，则尝试把“当前供应商”自动加入队列作为 P1，避免用户陷入无法开启的死锁。
-        let mut queue = app_state.db.get_failover_queue(app_type_str)?;
+        let all_providers = app_state.db.get_all_providers(app_type_str)?;
+        let mut queue = app_state
+            .db
+            .get_failover_queue(app_type_str)?
+            .into_iter()
+            .filter(|item| {
+                all_providers
+                    .get(&item.provider_id)
+                    .is_some_and(|provider| {
+                        crate::proxy::provider_router::provider_supports_failover(
+                            app_type_str,
+                            provider,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
         if queue.is_empty() {
             let current_id =
                 crate::settings::get_effective_current_provider(&app_state.db, app_type)?;
@@ -474,10 +586,33 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
                     "故障转移队列为空，且未设置当前供应商，无法启用 Auto 模式".to_string(),
                 ));
             };
+            let current = app_state
+                .db
+                .get_provider_by_id(&current_id, app_type_str)?
+                .ok_or_else(|| AppError::Message(format!("供应商不存在: {current_id}")))?;
+            if !crate::proxy::provider_router::provider_supports_failover(app_type_str, &current) {
+                return Err(AppError::Message(
+                    "Codex Official 账号卡不支持自动故障转移".to_string(),
+                ));
+            }
             app_state
                 .db
                 .add_to_failover_queue(app_type_str, &current_id)?;
-            queue = app_state.db.get_failover_queue(app_type_str)?;
+            queue = app_state
+                .db
+                .get_failover_queue(app_type_str)?
+                .into_iter()
+                .filter(|item| {
+                    all_providers
+                        .get(&item.provider_id)
+                        .is_some_and(|provider| {
+                            crate::proxy::provider_router::provider_supports_failover(
+                                app_type_str,
+                                provider,
+                            )
+                        })
+                })
+                .collect();
         }
 
         let p1_provider_id = queue
@@ -597,7 +732,13 @@ pub fn create_tray_menu(
     app_state: &AppState,
 ) -> Result<Menu<tauri::Wry>, AppError> {
     let app_settings = crate::settings::get_settings();
-    let tray_texts = TrayTexts::from_language(app_settings.language.as_deref().unwrap_or("zh"));
+    // 用户未显式设置语言（首次安装）时，按系统区域回退而非硬编码简体，
+    // 否则繁中系统的托盘会固定显示简体直到用户手动切换一次。
+    let language: &str = match app_settings.language.as_deref() {
+        Some(lang) => lang,
+        None => detect_system_tray_language(),
+    };
+    let tray_texts = TrayTexts::from_language(language);
 
     // Get visible apps setting, default to all visible
     let visible_apps = app_settings.visible_apps.unwrap_or_default();
@@ -651,8 +792,13 @@ pub fn create_tray_menu(
             let current_provider = providers.get(&current_id);
             let submenu_label = match current_provider {
                 Some(p) => {
-                    let suffix = format_usage_suffix(app_state, &section.app_type, p, &current_id)
-                        .unwrap_or_default();
+                    let suffix = format_usage_suffix(
+                        &app_state.usage_cache,
+                        &section.app_type,
+                        p,
+                        &current_id,
+                    )
+                    .unwrap_or_default();
                     format!("{} · {}{}", section.header_label, p.name, suffix)
                 }
                 None => section.header_label.to_string(),
@@ -673,8 +819,12 @@ pub fn create_tray_menu(
 
             for (id, provider) in sort_providers(&providers) {
                 let is_current = current_id == *id;
-                let is_official_blocked =
-                    is_app_taken_over && provider.category.as_deref() == Some("official");
+                let is_official_blocked = is_app_taken_over
+                    && provider.category.as_deref() == Some("official")
+                    && !crate::services::provider::official_provider_supports_proxy_takeover(
+                        &section.app_type,
+                        provider,
+                    );
                 let label = if is_official_blocked {
                     format!("{} \u{26D4}", &provider.name) // ⛔ emoji
                 } else {
@@ -844,8 +994,13 @@ fn update_tray_usage_labels(app: &tauri::AppHandle) {
         let Some(provider) = providers.get(&current_id) else {
             continue;
         };
-        let suffix = format_usage_suffix(&app_state, &section.app_type, provider, &current_id)
-            .unwrap_or_default();
+        let suffix = format_usage_suffix(
+            &app_state.usage_cache,
+            &section.app_type,
+            provider,
+            &current_id,
+        )
+        .unwrap_or_default();
         let new_label = format!("{} · {}{}", section.header_label, provider.name, suffix);
         if let Err(e) = submenu.set_text(&new_label) {
             log::debug!("[Tray] 更新{}子菜单标题失败: {e}", section.log_name);
@@ -975,8 +1130,8 @@ pub fn schedule_tray_refresh(app: &tauri::AppHandle) {
 /// 雪崩请求；互斥锁被毒化时以上次状态为准继续推进，不会永久阻塞。
 ///
 /// 刷新面与 `format_usage_suffix` 的展示面严格对齐 —— 每次悬停最多发
-/// `TRAY_SECTIONS.len()` 次外部请求；只有显式启用的用量查询（含官方订阅、
-/// coding_plan / balance / Copilot / 自定义脚本）才会发请求。
+/// `TRAY_SECTIONS.len()` 个用量查询；按供应商用量开关查询，Codex 托管账号
+/// 未保存开关时与卡片一致默认启用。
 pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
     use crate::commands::CopilotAuthState;
     use futures::future::join_all;
@@ -1004,7 +1159,7 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
         .visible_apps
         .unwrap_or_default();
 
-    let mut script_futures = Vec::new();
+    let mut usage_futures = Vec::new();
 
     for section in TRAY_SECTIONS.iter() {
         if !visible_apps.is_visible(&section.app_type) {
@@ -1037,49 +1192,271 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
             }
         };
 
-        // 与 format_usage_suffix 同一优先级：只有显式启用的用量查询才发请求。
-        let is_official_provider = current.category.as_deref() == Some("official");
-        if current.has_usage_script_enabled()
-            && (!is_official_provider || provider_uses_official_subscription(&current))
-        {
+        if let Some(source) = tray_usage_source(&section.app_type, &current) {
             let app_clone = app.clone();
             let state = app.state::<AppState>();
             let copilot_state = app.state::<CopilotAuthState>();
+            let xai_state = app.state::<crate::commands::XaiOAuthState>();
             let provider_id = current_id.clone();
             let app_str = app_type_str.to_string();
-            script_futures.push(async move {
-                if let Err(e) = crate::commands::queryProviderUsage(
-                    app_clone,
-                    state,
-                    copilot_state,
-                    provider_id.clone(),
-                    app_str,
-                )
-                .await
-                {
+            usage_futures.push(async move {
+                let result = match source {
+                    TrayUsageSource::ManagedCodex(account_id) => {
+                        let codex_state = app.state::<crate::commands::CodexOAuthState>();
+                        crate::commands::get_codex_oauth_quota(
+                            app_clone,
+                            state,
+                            Some(account_id),
+                            codex_state,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                    TrayUsageSource::Script => crate::commands::queryProviderUsage(
+                        app_clone,
+                        state,
+                        copilot_state,
+                        xai_state,
+                        provider_id.clone(),
+                        app_str,
+                    )
+                    .await
+                    .map(|_| ()),
+                };
+                if let Err(e) = result {
                     log::debug!("[Tray] 刷新{log_name}供应商 {provider_id} 用量失败: {e}");
                 }
             });
         }
     }
 
-    join_all(script_futures).await;
+    join_all(usage_futures).await;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_script_summary, format_subscription_summary, TRAY_ID};
-    use crate::provider::{UsageData, UsageResult};
+    use super::{
+        format_script_summary, format_subscription_summary, format_usage_suffix,
+        provider_uses_official_subscription, tray_usage_source, TrayUsageSource, TRAY_ID,
+        TRAY_SECTIONS,
+    };
+    use crate::app_config::AppType;
+    use crate::provider::{Provider, UsageData, UsageResult};
     use crate::services::subscription::{
         CredentialStatus, QuotaTier, SubscriptionQuota, TIER_FIVE_HOUR, TIER_GEMINI_FLASH,
-        TIER_GEMINI_FLASH_LITE, TIER_GEMINI_PRO, TIER_MONTHLY, TIER_SEVEN_DAY, TIER_SEVEN_DAY_OPUS,
-        TIER_SEVEN_DAY_SONNET, TIER_THIRTY_DAY, TIER_WEEKLY_LIMIT,
+        TIER_GEMINI_FLASH_LITE, TIER_GEMINI_PRO, TIER_MONTHLY, TIER_SEVEN_DAY,
+        TIER_SEVEN_DAY_FABLE, TIER_SEVEN_DAY_OPUS, TIER_SEVEN_DAY_SONNET, TIER_THIRTY_DAY,
+        TIER_WEEKLY_LIMIT,
     };
+    use crate::services::usage_cache::UsageCache;
 
     #[test]
     fn tray_id_is_unique_to_app() {
         assert_eq!(TRAY_ID, "cc-switch");
         assert_ne!(TRAY_ID, "main");
+    }
+
+    fn codex_provider(account_id: Option<&str>, enabled: Option<bool>) -> Provider {
+        serde_json::from_value(serde_json::json!({
+            "id": "managed-codex",
+            "name": "Managed Codex",
+            "settingsConfig": {"auth": {}, "config": ""},
+            "category": "official",
+            "meta": {
+                "authBinding": account_id.map(|id| serde_json::json!({
+                    "source": "managed_account",
+                    "authProvider": "codex_oauth",
+                    "accountId": id
+                })),
+                "usage_script": enabled.map(|enabled| serde_json::json!({
+                    "enabled": enabled,
+                    "language": "javascript",
+                    "code": "",
+                    "templateType": "official_subscription"
+                }))
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn managed_codex_quota_stays_out_of_the_app_wide_tray_cache() {
+        let provider = |id| codex_provider(id, Some(true));
+        assert!(!provider_uses_official_subscription(&provider(Some(
+            "account-1"
+        ))));
+        assert!(provider_uses_official_subscription(&provider(None)));
+    }
+
+    #[test]
+    fn managed_codex_tray_refresh_respects_binding_and_usage_toggle() {
+        for enabled in [Some(true), None] {
+            let provider = codex_provider(Some("account-1"), enabled);
+            assert_eq!(
+                tray_usage_source(&AppType::Codex, &provider),
+                Some(TrayUsageSource::ManagedCodex("account-1".to_string()))
+            );
+        }
+        let disabled = codex_provider(Some("account-1"), Some(false));
+        assert_eq!(tray_usage_source(&AppType::Codex, &disabled), None);
+
+        let mut fixed = codex_provider(Some("account-1"), Some(true));
+        fixed.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        assert_eq!(
+            tray_usage_source(&AppType::Codex, &fixed),
+            Some(TrayUsageSource::ManagedCodex("account-1".to_string()))
+        );
+        assert_eq!(
+            tray_usage_source(&AppType::Codex, &codex_provider(None, Some(true))),
+            Some(TrayUsageSource::Script)
+        );
+        let mut legacy = codex_provider(Some(" account-1 "), None);
+        legacy.category = None;
+        assert_eq!(
+            tray_usage_source(&AppType::Codex, &legacy),
+            Some(TrayUsageSource::ManagedCodex("account-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn managed_codex_tray_uses_bound_account_after_switch_or_rebind() {
+        let cache = UsageCache::new();
+        let first = codex_provider(Some("account-1"), Some(true));
+        let mut second = codex_provider(Some("account-2"), Some(true));
+        second.id = "second-provider".to_string();
+        let label = |provider: &Provider| {
+            format_usage_suffix(&cache, &AppType::Codex, provider, &provider.id)
+        };
+        cache.put_subscription(
+            AppType::Codex,
+            make_quota("codex", true, vec![tier(TIER_FIVE_HOUR, 99.0)]),
+        );
+        cache.put_script(
+            AppType::Codex,
+            first.id.clone(),
+            usage_result(true, vec![usage_data(Some(TIER_FIVE_HOUR), 99.0)]),
+        );
+        // Neither CLI nor stale provider-scoped data may fill an account miss.
+        assert_eq!(label(&first), None);
+        cache.put_codex_oauth(
+            "account-1".to_string(),
+            make_quota("codex_oauth", true, vec![tier(TIER_FIVE_HOUR, 12.0)]),
+        );
+        assert_eq!(label(&first).as_deref(), Some(" · 🟢 h12%"));
+        assert_eq!(label(&second), None);
+        cache.put_codex_oauth(
+            "account-2".to_string(),
+            make_quota("codex_oauth", true, vec![tier(TIER_FIVE_HOUR, 25.0)]),
+        );
+        assert_eq!(label(&second).as_deref(), Some(" · 🟢 h25%"));
+        // Rebinding the same provider must select the new account's snapshot.
+        second.id = first.id.clone();
+        assert_eq!(label(&second).as_deref(), Some(" · 🟢 h25%"));
+        // A late response for the previous account cannot overwrite this label.
+        cache.put_codex_oauth(
+            "account-1".to_string(),
+            make_quota("codex_oauth", true, vec![tier(TIER_FIVE_HOUR, 40.0)]),
+        );
+        assert_eq!(label(&second).as_deref(), Some(" · 🟢 h25%"));
+        assert_eq!(label(&first).as_deref(), Some(" · 🟢 h40%"));
+
+        let disabled = codex_provider(Some("account-2"), Some(false));
+        assert_eq!(label(&disabled), None);
+        assert_eq!(label(&second).as_deref(), Some(" · 🟢 h25%"));
+        cache.put_codex_oauth(
+            "account-2".to_string(),
+            SubscriptionQuota::error(
+                "codex_oauth",
+                CredentialStatus::Expired,
+                "expired".to_string(),
+            ),
+        );
+        assert_eq!(label(&second), None);
+        assert_eq!(label(&first).as_deref(), Some(" · 🟢 h40%"));
+    }
+
+    #[test]
+    fn native_codex_tray_still_uses_cli_subscription() {
+        let cache = UsageCache::new();
+        let mut native = codex_provider(None, Some(true));
+        native.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        cache.put_codex_oauth(
+            "account-1".to_string(),
+            make_quota("codex_oauth", true, vec![tier(TIER_FIVE_HOUR, 12.0)]),
+        );
+        cache.put_subscription(
+            AppType::Codex,
+            make_quota("codex", true, vec![tier(TIER_FIVE_HOUR, 25.0)]),
+        );
+        assert_eq!(
+            format_usage_suffix(&cache, &AppType::Codex, &native, &native.id).as_deref(),
+            Some(" · 🟢 h25%")
+        );
+    }
+
+    #[test]
+    fn locale_maps_traditional_chinese_variants_to_zh_tw() {
+        use super::map_locale_to_tray_language;
+        for locale in [
+            "zh-TW",
+            "zh-HK",
+            "zh-MO",
+            "zh-Hant",
+            "zh-Hant-TW",
+            "zh-hant-hk",
+        ] {
+            assert_eq!(
+                map_locale_to_tray_language(locale),
+                "zh-TW",
+                "expected {locale} -> zh-TW"
+            );
+        }
+    }
+
+    #[test]
+    fn locale_maps_simplified_chinese_variants_to_zh() {
+        use super::map_locale_to_tray_language;
+        for locale in ["zh", "zh-CN", "zh-SG", "zh-Hans", "zh-Hans-CN"] {
+            assert_eq!(
+                map_locale_to_tray_language(locale),
+                "zh",
+                "expected {locale} -> zh"
+            );
+        }
+    }
+
+    #[test]
+    fn locale_maps_japanese_and_english() {
+        use super::map_locale_to_tray_language;
+        assert_eq!(map_locale_to_tray_language("ja-JP"), "ja");
+        assert_eq!(map_locale_to_tray_language("ja"), "ja");
+        assert_eq!(map_locale_to_tray_language("en-US"), "en");
+        assert_eq!(map_locale_to_tray_language("en"), "en");
+    }
+
+    #[test]
+    fn locale_unknown_falls_back_to_zh() {
+        use super::map_locale_to_tray_language;
+        // 与前端 getInitialLanguage 的默认值保持一致。
+        for locale in ["de-DE", "fr", "ko-KR", ""] {
+            assert_eq!(
+                map_locale_to_tray_language(locale),
+                "zh",
+                "expected {locale} -> zh (default)"
+            );
+        }
+    }
+
+    #[test]
+    fn tray_sections_include_grokbuild_provider_switching() {
+        let section = TRAY_SECTIONS
+            .iter()
+            .find(|section| section.app_type == AppType::GrokBuild)
+            .expect("Grok Build tray section should exist");
+
+        assert_eq!(section.prefix, "grokbuild_");
+        assert_eq!(section.empty_id, "grokbuild_empty");
+        assert_eq!(section.header_label, "Grok Build");
     }
 
     fn make_quota(tool: &str, success: bool, tiers: Vec<QuotaTier>) -> SubscriptionQuota {
@@ -1115,6 +1492,45 @@ mod tests {
         let s = format_subscription_summary(&quota).expect("should format");
         assert!(s.contains("h9%"), "expected h9% in {s}");
         assert!(s.contains("w27%"), "expected w27% in {s}");
+    }
+
+    #[test]
+    fn claude_fable_summary_keeps_weekly_total_and_model_limit_separate() {
+        let quota = make_quota(
+            "claude",
+            true,
+            vec![
+                tier(TIER_FIVE_HOUR, 12.0),
+                tier(TIER_SEVEN_DAY, 25.0),
+                tier(TIER_SEVEN_DAY_FABLE, 95.0),
+            ],
+        );
+        assert_eq!(
+            format_subscription_summary(&quota).as_deref(),
+            Some("🔴 h12% w25% Fable95%")
+        );
+        // 模板查询扁平化后的 UsageData 也必须生成相同摘要。
+        let result = usage_result(
+            true,
+            vec![
+                usage_data(Some(TIER_FIVE_HOUR), 12.0),
+                usage_data(Some(TIER_SEVEN_DAY), 25.0),
+                usage_data(Some(TIER_SEVEN_DAY_FABLE), 95.0),
+            ],
+        );
+        assert_eq!(
+            format_script_summary(&result),
+            format_subscription_summary(&quota)
+        );
+    }
+
+    #[test]
+    fn claude_fable_summary_shows_unused_model_limit() {
+        let quota = make_quota("claude", true, vec![tier(TIER_SEVEN_DAY_FABLE, 0.0)]);
+        assert_eq!(
+            format_subscription_summary(&quota).as_deref(),
+            Some("🟢 Fable0%")
+        );
     }
 
     #[test]

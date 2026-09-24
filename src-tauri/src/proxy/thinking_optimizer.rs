@@ -80,6 +80,7 @@ pub(crate) fn uses_adaptive_thinking(model: &str) -> bool {
         "mythos-5",
         "mythos-preview",
         "sonnet-5",
+        "opus-5",
         "opus-4-8",
         "opus-4-7",
         "opus-4-6",
@@ -137,7 +138,6 @@ mod tests {
             enabled: true,
             thinking_optimizer: true,
             cache_injection: true,
-            cache_ttl: "1h".to_string(),
         }
     }
 
@@ -146,7 +146,6 @@ mod tests {
             enabled: true,
             thinking_optimizer: false,
             cache_injection: true,
-            cache_ttl: "1h".to_string(),
         }
     }
 
@@ -174,6 +173,7 @@ mod tests {
             "claude-sonnet-5",
             "anthropic/claude-fable-5",
             "claude-mythos-5",
+            "claude-opus-5",
             "claude-opus-4.8",
         ] {
             assert!(uses_adaptive_thinking(model), "model={model}");

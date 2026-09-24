@@ -4,6 +4,9 @@ export type AppId =
   | "claude-desktop"
   | "codex"
   | "gemini"
+  | "grokbuild"
   | "opencode"
   | "openclaw"
-  | "hermes";
+  | "hermes"
+  | "pi"
+  | "mcode";

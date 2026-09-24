@@ -111,18 +111,6 @@ export interface UsageResult {
   error?: string;
 }
 
-// 供应商单独的连通检测配置（覆盖全局配置）
-export interface ProviderTestConfig {
-  // 是否启用单独配置（false 时使用全局配置）
-  enabled: boolean;
-  // 超时时间（秒）
-  timeoutSecs?: number;
-  // 降级阈值（毫秒）
-  degradedThresholdMs?: number;
-  // 最大重试次数
-  maxRetries?: number;
-}
-
 export type AuthBindingSource = "provider_config" | "managed_account";
 
 export interface AuthBinding {
@@ -154,7 +142,10 @@ export type CodexChatEffortValueMode =
   | "low_high"
   | "deepseek"
   // OpenRouter effort 枚举 xhigh|high|medium|low|minimal（无 max，max 钳到 xhigh）
-  | "openrouter";
+  | "openrouter"
+  // OpenCode Zen 网关：合法档位逐模型，见 modelCatalog 各条目 reasoningLevels
+  // （镜像 models.dev）；代理转换层按请求模型查表钳制，无表不发 effort 字段
+  | "zen";
 
 export type CodexChatReasoningOutputFormat =
   | "auto"
@@ -172,6 +163,8 @@ export interface CodexChatReasoning {
   // 声明性字段：标注上游 reasoning 回传位置。当前提取靠穷举字段，未读取此值（think_tags 尚未接线）。
   outputFormat?: CodexChatReasoningOutputFormat;
 }
+
+export type PromptCacheRoutingMode = "auto" | "enabled" | "disabled";
 
 export interface LocalProxyRequestOverrides {
   headers?: Record<string, string>;
@@ -196,8 +189,6 @@ export interface ProviderMeta {
   isPartner?: boolean;
   // 合作伙伴促销 key（用于后端识别 PackyCode 等）
   partnerPromotionKey?: string;
-  // 供应商单独的模型测试配置
-  testConfig?: ProviderTestConfig;
   // 供应商成本倍率
   costMultiplier?: string;
   // 供应商计费模式来源
@@ -220,6 +211,9 @@ export interface ProviderMeta {
   isFullUrl?: boolean;
   // Prompt cache key for OpenAI Responses-compatible endpoints (improves cache hit rate)
   promptCacheKey?: string;
+  // Session-based prompt-cache routing for Codex Responses -> Chat conversions.
+  // auto enables only for known-compatible upstreams; enabled/disabled are user overrides.
+  promptCacheRouting?: PromptCacheRoutingMode;
   // Codex OAuth FAST mode: injects service_tier="priority" on ChatGPT Codex requests
   codexFastMode?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata
@@ -236,6 +230,8 @@ export interface ProviderMeta {
   customUserAgent?: string;
   // Local proxy request overrides. Only applied by the local proxy after route transforms.
   localProxyRequestOverrides?: LocalProxyRequestOverrides;
+  // Whether this provider is currently projected into an additive app's live config.
+  liveConfigManaged?: boolean;
   // 供应商类型（用于识别 Copilot 等特殊供应商）
   providerType?: string;
   // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
@@ -269,15 +265,23 @@ export interface CodexCatalogModel {
   model: string;
   displayName?: string;
   contextWindow?: string | number;
-  // Native Responses (direct) profile overrides for the generated
-  // model-catalogs.json. Ignored by the chat/proxy profile.
-  // e.g. MiniMax: supportsParallelToolCalls=true, inputModalities=["text","image"].
+  // Hidden provider capability metadata for the generated model catalog.
+  // supportsParallelToolCalls is native-profile-only; inputModalities wins over
+  // automatic text-only model detection for every profile.
   supportsParallelToolCalls?: boolean;
   inputModalities?: string[];
   // Vendor's OFFICIAL base_instructions (model identity / system preamble).
   // Codex requires this field in every catalog entry; when omitted the backend
   // falls back to a neutral default. e.g. MiMo "developed by Xiaomi".
   baseInstructions?: string;
+  // Per-model reasoning effort levels exposed in the generated Codex catalog
+  // (e.g. ["none", "low", "medium", "high", "xhigh", "max"]). When omitted the
+  // backend keeps the template's conservative none/high default.
+  reasoningLevels?: string[];
+  // Per-model default reasoning effort. Only meaningful together with
+  // reasoningLevels; when omitted the backend keeps the template default if it
+  // is still in the list, otherwise the highest declared level.
+  defaultReasoningLevel?: string;
 }
 
 // Claude 认证字段类型
@@ -289,9 +293,12 @@ export interface VisibleApps {
   "claude-desktop": boolean;
   codex: boolean;
   gemini: boolean;
+  grokbuild: boolean;
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
+  pi: boolean;
+  mcode: boolean;
 }
 
 // WebDAV 同步状态
@@ -371,10 +378,12 @@ export interface Settings {
   // User has confirmed the usage query first-run notice
   usageConfirmed?: boolean;
   usageDashboardRefreshIntervalMs?: number;
-  // User has confirmed the stream check first-run notice
-  streamCheckConfirmed?: boolean;
+  // 会话用量自动扫描开关（默认开启=自动模式；关闭后仅手动同步时扫描会话日志，代理记账不受影响）
+  sessionAutoSyncEnabled?: boolean;
   // Whether to show the failover toggle independently on the main page
   enableFailoverToggle?: boolean;
+  // Whether to show the project profile switcher on the main page header
+  showProfileSwitcher?: boolean;
   // Preserve Codex ChatGPT login in auth.json when switching third-party providers
   preserveCodexOfficialAuthOnSwitch?: boolean;
   // Run official Codex under the shared "custom" provider id so future
@@ -403,12 +412,16 @@ export interface Settings {
   codexConfigDir?: string;
   // 覆盖 Gemini 配置目录（可选）
   geminiConfigDir?: string;
+  // 覆盖 Grok Build 配置目录（可选）
+  grokConfigDir?: string;
   // 覆盖 OpenCode 配置目录（可选）
   opencodeConfigDir?: string;
   // 覆盖 OpenClaw 配置目录（可选）
   openclawConfigDir?: string;
   // 覆盖 Hermes 配置目录（可选）
   hermesConfigDir?: string;
+  // 覆盖 Pi agent 配置目录（可选）
+  piConfigDir?: string;
 
   // ===== 当前供应商 ID（设备级）=====
   // 当前 Claude 供应商 ID（优先于数据库 is_current）
@@ -440,7 +453,7 @@ export interface Settings {
 
   // ===== 终端设置 =====
   // 首选终端应用（可选，默认使用系统默认终端）
-  // macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "wezterm" | "kaku"
+  // macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "otty" | "wezterm" | "kaku"
   // Windows: "cmd" | "powershell" | "wt"
   // Linux: "gnome-terminal" | "konsole" | "xfce4-terminal" | "alacritty" | "kitty" | "ghostty"
   preferredTerminal?: string;
@@ -493,10 +506,12 @@ export interface McpServerSpec {
 
 // v3.7.0: MCP 服务器应用启用状态
 export interface McpApps {
+  mcode?: boolean;
   claude: boolean;
   "claude-desktop"?: boolean;
   codex: boolean;
   gemini: boolean;
+  grokbuild?: boolean;
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;

@@ -71,6 +71,10 @@ impl Provider {
         self.provider_type() == Some("codex_oauth")
     }
 
+    pub fn is_xai_oauth(&self) -> bool {
+        self.provider_type() == Some("xai_oauth")
+    }
+
     pub fn is_github_copilot(&self) -> bool {
         self.provider_type() == Some("github_copilot")
             || self.claude_base_url_contains("githubcopilot.com")
@@ -79,7 +83,29 @@ impl Provider {
     pub fn uses_managed_account_auth(&self) -> bool {
         self.is_github_copilot()
             || self.is_codex_oauth()
+            || self.is_xai_oauth()
             || self.claude_base_url_contains("chatgpt.com/backend-api/codex")
+    }
+
+    /// Third-party managed OAuth (xai_oauth, github_copilot, …): the real
+    /// credential is injected per-request by the local proxy, so the card is
+    /// keyless by design and its stored config is only an upstream snapshot.
+    /// `codex_oauth` is deliberately excluded — the official ChatGPT login
+    /// in auth.json IS its credential, so the `requires_openai_auth = true`
+    /// fallback is its correct shape, never a legacy leftover.
+    pub fn uses_proxy_injected_oauth(&self) -> bool {
+        self.is_xai_oauth() || self.is_github_copilot()
+    }
+
+    /// Whether the provider form's "auth field" was explicitly set to
+    /// ANTHROPIC_API_KEY. The form only persists `meta.apiKeyField` for the
+    /// non-default choice, so `None` means the default ANTHROPIC_AUTH_TOKEN.
+    pub fn claude_uses_api_key_field(&self) -> bool {
+        self.meta
+            .as_ref()
+            .and_then(|m| m.api_key_field.as_deref())
+            .map(|field| field.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
+            .unwrap_or(false)
     }
 
     fn provider_type(&self) -> Option<&str> {
@@ -164,6 +190,23 @@ impl Provider {
                 let api_key = first_non_empty(env, &["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
                 (base_url, api_key)
             }
+            // GrokBuild 的 base_url 与 api_key 必须各自解析：extract_credentials 在
+            // 凭据缺失时整个 Option 变 None，一并 unwrap_or_default 会把明明写在
+            // 配置里的 base_url 也清成空串。凭据缺失是常态（env_key 指向的变量在
+            // GUI 进程里读不到），端点不该被连坐——否则用量脚本的 {{baseUrl}} 变成
+            // 相对路径、余额查询只报「API key is empty」掩盖真因。
+            // 与上面 Codex 分支的写法保持一致。
+            AppType::GrokBuild => {
+                let config_text = settings.get("config").and_then(Value::as_str);
+                let base_url = config_text
+                    .and_then(crate::grok_config::extract_base_url)
+                    .unwrap_or_default();
+                let api_key = config_text
+                    .and_then(crate::grok_config::extract_credentials)
+                    .map(|(_, api_key)| api_key)
+                    .unwrap_or_default();
+                (base_url, api_key)
+            }
             // Hermes (config.yaml) flattens credentials at the top level, snake_case.
             AppType::Hermes => (
                 str_at(settings.get("base_url")),
@@ -174,8 +217,13 @@ impl Provider {
                 str_at(settings.get("baseUrl")),
                 str_at(settings.get("apiKey")),
             ),
+            // Pi custom providers use the native models.json field names.
+            AppType::Pi => (
+                crate::pi_config::provider_base_url(settings).unwrap_or_default(),
+                str_at(settings.get("apiKey")),
+            ),
             // OpenCode (OMO) nests credentials under `options` (the SDK options object).
-            AppType::OpenCode => {
+            AppType::OpenCode | AppType::Mcode => {
                 let options = settings.get("options");
                 (
                     str_at(options.and_then(|o| o.get("baseURL"))),
@@ -303,26 +351,6 @@ pub struct UsageResult {
     pub error: Option<String>,
 }
 
-/// 供应商单独的连通检测配置
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProviderTestConfig {
-    /// 是否启用单独配置（false 时使用全局配置）
-    #[serde(default)]
-    pub enabled: bool,
-    /// 超时时间（秒）
-    #[serde(rename = "timeoutSecs", skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<u64>,
-    /// 降级阈值（毫秒）
-    #[serde(
-        rename = "degradedThresholdMs",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub degraded_threshold_ms: Option<u64>,
-    /// 最大重试次数
-    #[serde(rename = "maxRetries", skip_serializing_if = "Option::is_none")]
-    pub max_retries: Option<u32>,
-}
-
 /// 认证绑定来源
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -388,6 +416,12 @@ pub struct CodexChatReasoningConfig {
     /// 靠穷举字段提取、并不读取本字段；保留作文档说明与未来按格式分发（如 think_tags）的预留。
     #[serde(rename = "outputFormat", skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
+    /// 运行时字段（不持久化、不进 meta）：当前请求模型在平台侧声明的合法 effort
+    /// 档位，由 resolve 按请求模型从供应商 `settings_config.modelCatalog` 的
+    /// `reasoningLevels`（逐模型声明，见 #6228）查表填充。仅 "zen" 值映射消费：
+    /// Some → 钳到合法档；None → 不发 effort 字段（模型未收录或为 toggle 型）。
+    #[serde(skip)]
+    pub effort_levels: Option<Vec<String>>,
 }
 
 /// Local proxy request overrides applied after route/protocol transforms.
@@ -454,9 +488,6 @@ pub struct ProviderMeta {
     /// 每月消费限额（USD）
     #[serde(rename = "limitMonthlyUsd", skip_serializing_if = "Option::is_none")]
     pub limit_monthly_usd: Option<String>,
-    /// 供应商单独的模型测试配置
-    #[serde(rename = "testConfig", skip_serializing_if = "Option::is_none")]
-    pub test_config: Option<ProviderTestConfig>,
     /// Claude API 格式（仅 Claude 供应商使用）
     /// - "anthropic": 原生 Anthropic Messages API，直接透传
     /// - "openai_chat": OpenAI Chat Completions 格式，需要转换
@@ -480,6 +511,10 @@ pub struct ProviderMeta {
     /// identity when available; generated session IDs are not sent upstream.
     #[serde(rename = "promptCacheKey", skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// Session-based prompt-cache routing for Codex Responses -> Chat conversions.
+    /// "auto" enables known-compatible upstreams; "enabled" / "disabled" are overrides.
+    #[serde(rename = "promptCacheRouting", skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_routing: Option<String>,
     /// Codex OAuth FAST mode: inject `service_tier = "priority"` for ChatGPT Codex requests.
     #[serde(rename = "codexFastMode", skip_serializing_if = "Option::is_none")]
     pub codex_fast_mode: Option<bool>,
@@ -986,6 +1021,30 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn proxy_injected_oauth_excludes_codex_oauth() {
+        let mut provider = Provider::with_id("p".to_string(), "P".to_string(), json!({}), None);
+        assert!(!provider.uses_proxy_injected_oauth());
+
+        for (provider_type, expected) in [
+            ("xai_oauth", true),
+            ("github_copilot", true),
+            // the official ChatGPT login IS this card's credential — its
+            // auth.json fallback shape must never be neutralized
+            ("codex_oauth", false),
+        ] {
+            provider.meta = Some(ProviderMeta {
+                provider_type: Some(provider_type.to_string()),
+                ..ProviderMeta::default()
+            });
+            assert_eq!(
+                provider.uses_proxy_injected_oauth(),
+                expected,
+                "{provider_type}"
+            );
+        }
+    }
 
     #[test]
     fn provider_meta_serializes_pricing_model_source() {
@@ -1511,6 +1570,25 @@ mod tests {
             (
                 "https://api.deepseek.com".to_string(),
                 "sk-openclaw".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_pi_uses_native_model_level_base_url() {
+        let p = provider_with(json!({
+            "apiKey": "sk-pi",
+            "models": [{
+                "id": "model-a",
+                "api": "openai-completions",
+                "baseUrl": "https://api.example.com/v1/"
+            }]
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::Pi),
+            (
+                "https://api.example.com/v1".to_string(),
+                "sk-pi".to_string()
             )
         );
     }

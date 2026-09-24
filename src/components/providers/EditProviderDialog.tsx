@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,16 @@ import {
   ProviderForm,
   type ProviderFormValues,
 } from "@/components/providers/forms/ProviderForm";
-import { openclawApi, providersApi, vscodeApi, type AppId } from "@/lib/api";
+import { AuthSettingsPanel } from "@/components/providers/AuthSettingsPanel";
+import {
+  openclawApi,
+  providersApi,
+  vscodeApi,
+  type AppId,
+  type ManagedAuthProvider,
+} from "@/lib/api";
+import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
+import { resolveCodexOfficialIdentity } from "@/utils/providerCapabilities";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -22,6 +31,91 @@ interface EditProviderDialogProps {
   isProxyTakeover?: boolean; // 代理接管模式下不读取 live（避免显示被接管后的代理配置）
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const hasAuthMaterial = (value: unknown): boolean => {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+};
+
+/**
+ * Whether an auth payload actually carries a credential, ignoring the bare
+ * `auth_mode` marker — the frontend twin of the backend
+ * `codex_auth_has_login_material`.
+ */
+const hasCodexAuthMaterial = (auth: Record<string, unknown> | null): boolean =>
+  auth !== null &&
+  Object.entries(auth).some(
+    ([key, value]) => key !== "auth_mode" && hasAuthMaterial(value),
+  );
+
+/**
+ * Rebuild the provider auth only for a current Codex provider's live snapshot.
+ *
+ * In official-auth-preservation mode, live config.toml owns the active
+ * provider bearer while the shared auth.json may belong to another provider or
+ * contain the user's ChatGPT login. Stored provider auth remains the template:
+ * this mirrors the backend switch-away backfill and avoids copying shared auth
+ * material into the provider row. DB snapshots and presets must keep their
+ * normal auth-first precedence.
+ */
+const reconcileCodexLiveAuth = (
+  liveSettings: Record<string, unknown>,
+  storedSettings: Record<string, unknown> | null,
+  isOfficialProvider: boolean,
+): Record<string, unknown> => {
+  if (isOfficialProvider) return liveSettings;
+
+  const configText =
+    typeof liveSettings.config === "string" ? liveSettings.config : "";
+  const bearer = extractCodexExperimentalBearerToken(configText);
+  const liveAuth = asRecord(liveSettings.auth);
+  const storedAuth = asRecord(storedSettings?.auth);
+
+  if (!bearer) {
+    // Live auth.json is a single shared slot with no provider identity, and a
+    // third-party Codex route never reads it: the switch deletes the file in
+    // default mode and injects the key into config.toml instead — an injection
+    // that is skipped entirely when the provider table declares its own
+    // credential source (`env_key`, `auth`/`aws`, an explicit Authorization
+    // header). A credential-less live auth (missing file, or the bare
+    // `auth_mode` logout marker) is therefore an absent field, not an emptied
+    // one: keep the stored template so saving the form cannot silently erase
+    // the only remaining copy of the provider's key.
+    if (!hasCodexAuthMaterial(liveAuth) && hasCodexAuthMaterial(storedAuth)) {
+      return { ...liveSettings, auth: storedAuth };
+    }
+    return liveSettings;
+  }
+
+  const authTemplate = storedAuth ?? liveAuth ?? {};
+  const hasProviderApiKey =
+    typeof authTemplate.OPENAI_API_KEY === "string" &&
+    authTemplate.OPENAI_API_KEY.trim().length > 0;
+  const hasOauthLogin = Object.entries(authTemplate).some(
+    ([key, value]) =>
+      key !== "auth_mode" && key !== "OPENAI_API_KEY" && hasAuthMaterial(value),
+  );
+
+  // Match should_restore_codex_provider_token_for_backfill: an OAuth-only
+  // provider must not be silently converted into an API-key provider.
+  if (hasOauthLogin && !hasProviderApiKey) return liveSettings;
+
+  return {
+    ...liveSettings,
+    auth: {
+      ...authTemplate,
+      OPENAI_API_KEY: bearer,
+    },
+  };
+};
+
 export function EditProviderDialog({
   open,
   provider,
@@ -32,6 +126,35 @@ export function EditProviderDialog({
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
+  const [authSettingsTarget, setAuthSettingsTarget] =
+    useState<ManagedAuthProvider | null>(null);
+
+  useEffect(() => {
+    setAuthSettingsTarget(null);
+  }, [appId, open, provider?.id]);
+
+  const formReadyToken = useMemo(
+    () => Symbol("provider-form-ready"),
+    [appId, open, provider?.id],
+  );
+  const currentFormReadyToken = useRef(formReadyToken);
+  currentFormReadyToken.current = formReadyToken;
+  const [formReadyState, setFormReadyState] = useState({
+    token: formReadyToken,
+    ready: appId !== "pi",
+  });
+  const isFormReady =
+    formReadyState.token === formReadyToken
+      ? formReadyState.ready
+      : appId !== "pi";
+  const handleSubmitReadyChange = useCallback(
+    (ready: boolean) => {
+      if (currentFormReadyToken.current === formReadyToken) {
+        setFormReadyState({ token: formReadyToken, ready });
+      }
+    },
+    [formReadyToken],
+  );
 
   // 默认使用传入的 provider.settingsConfig，若当前编辑对象是"当前生效供应商"，则尝试读取实时配置替换初始值
   const [liveSettings, setLiveSettings] = useState<Record<
@@ -41,6 +164,19 @@ export function EditProviderDialog({
 
   // 使用 ref 标记是否已经加载过，防止重复读取覆盖用户编辑
   const [hasLoadedLive, setHasLoadedLive] = useState(false);
+
+  const closeDialog = useCallback(() => {
+    setAuthSettingsTarget(null);
+    onOpenChange(false);
+  }, [onOpenChange]);
+
+  const handlePanelClose = useCallback(() => {
+    if (authSettingsTarget) {
+      setAuthSettingsTarget(null);
+      return;
+    }
+    closeDialog();
+  }, [authSettingsTarget, closeDialog]);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,10 +202,10 @@ export function EditProviderDialog({
         return;
       }
 
-      // OpenCode uses additive mode - each provider's config is stored independently in DB
-      // Reading live config would return the full opencode.json (with $schema, provider, mcp etc.)
-      // instead of just the provider fragment, causing incorrect nested structure on save
-      if (appId === "opencode") {
+      // OpenCode uses additive mode, while Pi's shared models.json is owned by
+      // the catalog coordinator. Neither has a per-provider generic live
+      // snapshot that may replace the DB aggregate in this form.
+      if (appId === "opencode" || appId === "pi" || appId === "mcode") {
         if (!cancelled) {
           setLiveSettings(null);
           setHasLoadedLive(true);
@@ -131,11 +267,23 @@ export function EditProviderDialog({
     };
   }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover]); // 只依赖 provider.id，不依赖整个 provider 对象
 
+  // Legacy official cards may have no category; their live logout still owns auth.
+  const isCodexOfficialProvider =
+    appId === "codex" &&
+    provider !== null &&
+    (provider.category === "official" ||
+      resolveCodexOfficialIdentity(appId, provider) !== null);
+
   const initialSettingsConfig = useMemo(() => {
-    const base = (liveSettings ?? provider?.settingsConfig ?? {}) as Record<
-      string,
-      unknown
-    >;
+    const storedSettings = asRecord(provider?.settingsConfig);
+    const base =
+      appId === "codex" && liveSettings
+        ? reconcileCodexLiveAuth(
+            liveSettings,
+            storedSettings,
+            isCodexOfficialProvider,
+          )
+        : (liveSettings ?? storedSettings ?? {});
 
     // Codex 的 modelCatalog 是 cc-switch 私有字段，SSOT 在数据库。Live 的 config.toml
     // 仅在写入时投影出 model_catalog_json 指针；Codex.app 改写配置、代理接管/恢复周期、
@@ -156,7 +304,7 @@ export function EditProviderDialog({
     }
 
     return base;
-  }, [liveSettings, provider?.settingsConfig, appId]); // 只依赖 settingsConfig，不依赖整个 provider
+  }, [liveSettings, provider?.settingsConfig, isCodexOfficialProvider, appId]); // 只依赖表单初始化所需字段，不依赖整个 provider
 
   // 固定 initialData，防止 provider 对象更新时重置表单
   const initialData = useMemo(() => {
@@ -174,7 +322,7 @@ export function EditProviderDialog({
   }, [
     open, // 修复：编辑保存后再次打开显示旧数据，依赖 open 确保每次打开时重新读取最新 provider 数据
     provider?.id, // 只依赖 ID，provider 对象更新不会触发重新计算
-    provider?.meta, // 需要依赖 meta 以便正确初始化 testConfig
+    provider?.meta, // 供应商元数据变化时重新初始化表单
     initialSettingsConfig,
   ]);
 
@@ -189,7 +337,7 @@ export function EditProviderDialog({
         unknown
       >;
       const nextProviderId =
-        (appId === "opencode" || appId === "openclaw") &&
+        (appId === "opencode" || appId === "openclaw" || appId === "pi") &&
         values.providerKey?.trim()
           ? values.providerKey.trim()
           : provider.id;
@@ -212,9 +360,9 @@ export function EditProviderDialog({
         provider: updatedProvider,
         originalId: provider.id,
       });
-      onOpenChange(false);
+      closeDialog();
     },
-    [appId, onSubmit, onOpenChange, provider],
+    [appId, onSubmit, closeDialog, provider],
   );
 
   if (!provider || !initialData) {
@@ -225,12 +373,13 @@ export function EditProviderDialog({
     <FullScreenPanel
       isOpen={open}
       title={t("provider.editProvider")}
-      onClose={() => onOpenChange(false)}
+      onClose={handlePanelClose}
+      contentClassName={appId === "pi" ? "pb-0" : undefined}
       footer={
         <Button
           type="submit"
           form="provider-form"
-          disabled={isFormSubmitting}
+          disabled={isFormSubmitting || !isFormReady}
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
           <Save className="h-4 w-4 mr-2" />
@@ -243,11 +392,17 @@ export function EditProviderDialog({
         providerId={provider.id}
         submitLabel={t("common.save")}
         onSubmit={handleSubmit}
-        onCancel={() => onOpenChange(false)}
+        onCancel={closeDialog}
+        onManageAuthAccounts={setAuthSettingsTarget}
         onSubmittingChange={setIsFormSubmitting}
+        onSubmitReadyChange={handleSubmitReadyChange}
         initialData={initialData}
         showButtons={false}
         isProxyTakeover={isProxyTakeover}
+      />
+      <AuthSettingsPanel
+        target={authSettingsTarget}
+        onClose={() => setAuthSettingsTarget(null)}
       />
     </FullScreenPanel>
   );

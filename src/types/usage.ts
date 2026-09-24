@@ -40,6 +40,8 @@ export interface SessionSyncResult {
   imported: number;
   skipped: number;
   filesScanned: number;
+  suspectedDuplicates: number;
+  deferredFiles: number;
   errors: string[];
 }
 
@@ -63,6 +65,20 @@ export interface ModelPricing {
   outputCostPerMillion: string;
   cacheReadCostPerMillion: string;
   cacheCreationCostPerMillion: string;
+}
+
+export interface ModelsDevSyncConfig {
+  autoSyncEnabled: boolean;
+  includeCommonModels: boolean;
+  selectedModelKeys: string[];
+  excludedCommonModelKeys: string[];
+  lastSyncAt: number | null;
+  lastSyncError: string | null;
+}
+
+export interface ModelsDevSyncState {
+  config: ModelsDevSyncConfig;
+  configPath: string;
 }
 
 export interface UsageSummary {
@@ -169,10 +185,18 @@ export interface UsageRangeSelection {
  * only ever show a partial number and mislead users into reading it as the
  * Desktop's full usage. The backend collapses `claude-desktop → claude` in
  * every dashboard query (see `folded_app_type_sql`).
- * `opencode` / `openclaw` / `hermes` have no proxy handler at all — they
- * appear only as managed apps elsewhere.
+ * `opencode` and `pi` have no proxy handler; their usage reaches this
+ * dashboard through session importers. `openclaw` / `hermes` appear only as
+ * managed apps elsewhere.
  */
-export type AppType = "claude" | "codex" | "gemini" | "opencode";
+export type AppType =
+  | "claude"
+  | "codex"
+  | "gemini"
+  | "grokbuild"
+  | "opencode"
+  | "pi"
+  | "mcode";
 
 export type AppTypeFilter = "all" | AppType;
 
@@ -180,7 +204,10 @@ export const KNOWN_APP_TYPES: ReadonlyArray<AppType> = [
   "claude",
   "codex",
   "gemini",
+  "grokbuild",
   "opencode",
+  "pi",
+  "mcode",
 ];
 
 /**
@@ -198,7 +225,32 @@ export const KNOWN_APP_TYPES: ReadonlyArray<AppType> = [
 export const CACHE_INCLUSIVE_APP_TYPES: ReadonlySet<string> = new Set([
   "codex",
   "gemini",
+  "grokbuild",
 ]);
+
+// Pi sessions can mix Anthropic and OpenAI APIs, but the dashboard aggregates
+// only by app type. Treat cache-write coverage as partial without changing
+// Pi's fresh-input token semantics.
+const PARTIAL_CACHE_WRITE_APP_TYPES: ReadonlySet<string> = new Set([
+  "pi",
+  "mcode",
+]);
+
+export type CacheWriteAvailability = "ok" | "partial" | "na";
+
+export function getCacheWriteAvailability(
+  appTypes: readonly string[],
+): CacheWriteAvailability {
+  if (appTypes.length === 0) return "ok";
+  const unavailable = appTypes.filter((appType) =>
+    CACHE_INCLUSIVE_APP_TYPES.has(appType),
+  ).length;
+  if (unavailable === appTypes.length) return "na";
+  const partial = appTypes.some((appType) =>
+    PARTIAL_CACHE_WRITE_APP_TYPES.has(appType),
+  );
+  return unavailable === 0 && !partial ? "ok" : "partial";
+}
 
 /** Subset of request-log fields needed to derive cache-normalized input. */
 export interface CacheNormalizableLog {
